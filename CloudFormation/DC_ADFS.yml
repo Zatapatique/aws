@@ -34,6 +34,16 @@ Parameters:
     MaxLength: '15'
     AllowedPattern: '[a-zA-Z0-9]+'
     
+  DomainAdminPassword:
+    Description: >-
+      Password for the domainAdmin superuser account
+    Type: String
+    MinLength: '8'
+    MaxLength: '32'
+    AllowedPattern: >-
+      (?=^.{6,255}$)((?=.*\d)(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[^A-Za-z0-9])(?=.*[a-z])|(?=.*[^A-Za-z0-9])(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[A-Z])(?=.*[^A-Za-z0-9]))^.*
+    NoEcho: 'True'
+
   RestoreModePassword:
     Description: >-
       Password for a separate Administrator account when the domain controller
@@ -139,8 +149,8 @@ Resources:
                 IF %ERRORLEVEL% GTR 10 ( exit /b 1 ) else ( exit /b 0 )
                 
             'C:\cfn\scripts\CreateDomainAdmin.ps1':
-              content: |
-                $pwd = ConvertTo-SecureString -AsPlainText "Budapest99" -Force
+              content: !Sub |
+                $pwd = ConvertTo-SecureString -AsPlainText "${DomainAdminPassword}" -Force
                 $user = New-ADUser -Name "domainAdmin" -SamAccountName "domainAdmin" -AccountPassword $pwd -PassThru | Enable-ADAccount
                 $groups = "Administrators", "Domain Admins", "Enterprise Admins", "Group Policy Creator Owners", "Schema Admins"
                 foreach ($group in $groups) {
@@ -170,7 +180,6 @@ Resources:
           
   ADFSServer:
     Type: 'AWS::EC2::Instance'
-    # DependsOn: DomainControllerWaitCondition
     DependsOn: DomainController
     Properties:
       ImageId: !FindInMap 
@@ -189,31 +198,49 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${DomainDNSName} ADFS server
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT20M
 
     Metadata:
       'AWS::CloudFormation::Init':
         config:
           files:
-            'c:\cfn\cfn-hup.conf':
+            'C:\cfn\cfn-hup.conf':
               content: !Sub |
                 [main]
                 stack=${AWS::StackId}
                 region=${AWS::Region}
+            'C:\cfn\keys\cloud.lastpass.com.pfx':
+              source: "https://s3-eu-west-1.amazonaws.com/lastpass-ad-artifacts/keys/cloud.lastpass.com.pfx"
             'C:\cfn\scripts\SetDNSServer.ps1':
               content: !Sub |
                 $netadapter = Get-NetAdapter
                 Set-DnsClientServerAddress -InterfaceIndex $netadapter.ifIndex -ServerAddress ("${DomainController.PrivateIp}")
             'C:\cfn\scripts\JoinDomain.ps1':
               content: !Sub |
-                $adminpassword = Convertto-SecureString -String 'Budapest99' -Force -AsPlainText
+                $adminpassword = Convertto-SecureString -String '${DomainAdminPassword}' -Force -AsPlainText
                 $DomainAdminCreds = New-Object System.Management.Automation.PSCredential("${DomainNetBIOSName}\domainAdmin", $adminpassword)
                 Add-Computer -DomainName ${DomainNetBIOSName} -Credential $DomainAdminCreds -Restart -Force
+            'C:\cfn\scripts\InstallADFS.ps1':
+              content: !Sub |
+                Import-PfxCertificate -FilePath "C:\cfn\keys\cloud.lastpass.com.pfx" -CertStoreLocation Cert:\LocalMachine\My
+                Install-WindowsFeature ADFS-Federation –IncludeManagementTools
+                $adminpassword = Convertto-SecureString -String '${DomainAdminPassword}' -Force -AsPlainText
+                $DomainAdminCreds = New-Object System.Management.Automation.PSCredential("${DomainNetBIOSName}\domainAdmin", $adminpassword)
+                Install-AdfsFarm -CertificateThumbprint 3E455C2817BC79EF3338CDBC3D6AB4F666E051BE -FederationServiceName fs-testcorp5.cloud.lastpass.com -ServiceAccountCredential $DomainAdminCreds
+                Restart-Computer
 
           commands:
             1-set-dns-server:
               command: powershell.exe -command C:\cfn\scripts\SetDNSServer.ps1 > C:\cfn\log\set-dns-server.log
             2-join-domain:
               command: powershell.exe -command C:\cfn\scripts\JoinDomain.ps1 > C:\cfn\log\join-domain.log
+            3-install-adfs:
+              command: powershell.exe -command C:\cfn\scripts\InstallADFS.ps1 > C:\cfn\log\install-adfs.log
+              waitAfterCompletion: forever
+            4-signal-success:
+              command: !Sub cfn-signal.exe -e 0 --region ${AWS::Region} --stack ${AWS::StackId} --resource ADFSServer 
           services:
             windows:
               cfn-hup:
@@ -223,16 +250,6 @@ Resources:
                   - 'c:\cfn\cfn-hup.conf'
                   - 'c:\cfn\hooks.d\cfn-auto-reloader.conf'
 
-  DomainControllerWaitCondition:
-    Type: 'AWS::CloudFormation::WaitCondition'
-    DependsOn: DomainController
-    Properties:
-      Handle: !Ref DomainControllerWaitHandle
-      Timeout: '1200'
-      
-  DomainControllerWaitHandle:
-    Type: 'AWS::CloudFormation::WaitConditionHandle'
-    
   DomainControllerSecurityGroup:
     Type: 'AWS::EC2::SecurityGroup'
     Properties:
