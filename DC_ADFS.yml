@@ -1,0 +1,348 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >-
+  This template creates a single server installation of Active Directory. Domain
+  Administrator password will be the one retrieved from the instance. For adding
+  members to the domain, ensure that they are launched in domain member security
+  group created by this template and then configure them to use this instance's
+  private IP as the DNS server. **WARNING** This template creates Amazon EC2
+  Windows instance and related resources. You will be billed for the AWS
+  resources used if you create a stack from this template.
+  
+Parameters:
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+    
+  DomainDNSName:
+    Description: >-
+      Fully qualified domain name (FQDN) of the forest root domain e.g.
+      corp.example.com
+    Type: String
+    MinLength: '3'
+    MaxLength: '25'
+    AllowedPattern: '[a-zA-Z0-9]+\..+'
+    
+  DomainNetBIOSName:
+    Description: >-
+      NetBIOS name of the domain (upto 15 characters) for users of earlier
+      versions of Windows e.g. CORP
+    Type: String
+    MinLength: '1'
+    MaxLength: '15'
+    AllowedPattern: '[a-zA-Z0-9]+'
+    
+  RestoreModePassword:
+    Description: >-
+      Password for a separate Administrator account when the domain controller
+      is in Restore Mode. Must be at least 8 characters containing letters,
+      numbers and symbols
+    Type: String
+    MinLength: '8'
+    MaxLength: '32'
+    AllowedPattern: >-
+      (?=^.{6,255}$)((?=.*\d)(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[^A-Za-z0-9])(?=.*[a-z])|(?=.*[^A-Za-z0-9])(?=.*[A-Z])(?=.*[a-z])|(?=.*\d)(?=.*[A-Z])(?=.*[^A-Za-z0-9]))^.*
+    NoEcho: 'True'
+    
+  SourceCidrForRDP:
+    Description: >-
+      IP Cidr from which you are likely to RDP into the instances. You can add
+      rules later by modifying the created security groups e.g. 54.32.98.160/32
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    AllowedPattern: '^([0-9]+\.){3}[0-9]+\/[0-9]+$'
+    
+Mappings:
+  AWSRegion2AMI:
+    us-east-1:
+      Windows2012r2: ami-e443379e
+    us-west-2:
+      Windows2012r2: ami-aca706d4
+    us-west-1:
+      Windows2012r2: ami-fc2e2a9c
+    eu-west-1:
+      Windows2012r2: ami-811a9ef8
+    eu-west-2:
+      Windows2012r2: ami-217b6245
+    eu-west-3:
+      Windows2012r2: ami-8750e7fa
+    eu-central-1:
+      Windows2012r2: ami-8c57dce3
+    ap-northeast-1:
+      Windows2012r2: ami-e95ad78f
+    ap-northeast-2:
+      Windows2012r2: ami-a83492c6
+    ap-southeast-1:
+      Windows2012r2: ami-4bcaaa37
+    ap-southeast-2:
+      Windows2012r2: ami-21e31543
+    ap-south-1:
+      Windows2012r2: ami-34fab25b
+    us-east-2:
+      Windows2012r2: ami-c24e66a7
+    ca-central-1:
+      Windows2012r2: ami-21b30945
+    sa-east-1:
+      Windows2012r2: ami-eb91d787
+    cn-north-1:
+      Windows2012r2: ami-6729fb0a
+    cn-northwest-1:
+      Windows2012r2: ami-42b6a320
+      
+Resources:
+
+  DomainController:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: !FindInMap 
+        - AWSRegion2AMI
+        - !Ref 'AWS::Region'
+        - Windows2012r2
+      InstanceType: m4.large
+      SecurityGroups:
+        - !Ref DomainControllerSecurityGroup
+      KeyName: !Ref KeyName
+      UserData:
+        Fn::Base64: !Sub |
+          <script>
+          cfn-init.exe -v -s ${AWS::StackId} -r DomainController --region ${AWS::Region}
+          </script>
+      Tags:
+        - Key: Name
+          Value: !Sub ${DomainDNSName} DC
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT20M
+    Metadata:
+      'AWS::CloudFormation::Init':
+        config:
+          files:
+            'c:\cfn\cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+
+            'c:\cfn\hooks.d\cfn-auto-reloader.conf':
+              content: !Sub | 
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.DomainController.Metadata.AWS::CloudFormation::Init
+                action=cfn-init.exe -v -s ${AWS::StackId} -r DomainController --region ${AWS::Region}
+
+            'C:\cfn\RunCommand.bat':
+              content: |-
+                %~1
+                IF %ERRORLEVEL% GTR 10 ( exit /b 1 ) else ( exit /b 0 )
+                
+            'C:\cfn\scripts\CreateDomainAdmin.ps1':
+              content: |
+                $pwd = ConvertTo-SecureString -AsPlainText "Budapest99" -Force
+                $user = New-ADUser -Name "domainAdmin" -SamAccountName "domainAdmin" -AccountPassword $pwd -PassThru | Enable-ADAccount
+                $groups = "Administrators", "Domain Admins", "Enterprise Admins", "Group Policy Creator Owners", "Schema Admins"
+                foreach ($group in $groups) {
+                  Add-ADGroupMember $group -Members domainAdmin
+                }
+                
+          commands:
+            1-run-dcpromo:
+              command: !Sub 
+                C:\cfn\RunCommand.bat "dcpromo /unattend /ReplicaOrNewDomain:Domain /NewDomain:Forest /NewDomainDNSName:${DomainDNSName} /ForestLevel:4 /DomainNetbiosName:${DomainNetBIOSName} /DomainLevel:4 /InstallDNS:Yes /ConfirmGc:Yes /CreateDNSDelegation:No /DatabasePath:"C:\Windows\NTDS" /LogPath:"C:\Windows\NTDS"  /SYSVOLPath:"C:\Windows\SYSVOL" /SafeModeAdminPassword=${RestoreModePassword} /RebootOnCompletion:Yes"
+              waitAfterCompletion: forever
+            2-start-adws:
+              command: powershell.exe -Command $s = Get-Service -Name ADWS; while ($s.Status -ne 'Running'){ Start-Service ADWS; Start-Sleep 3 }
+            3-create-domain-admin:
+              command: powershell.exe -command C:\cfn\scripts\CreateDomainAdmin.ps1 > C:\cfn\log\create-domain-admin.log
+              waitAfterCompletion: 30
+            4-signal-success:
+              command: !Sub cfn-signal.exe -e 0 --region ${AWS::Region} --stack ${AWS::StackId} --resource DomainController 
+          services:
+            windows:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - 'c:\cfn\cfn-hup.conf'
+                  - 'c:\cfn\hooks.d\cfn-auto-reloader.conf'
+          
+  ADFSServer:
+    Type: 'AWS::EC2::Instance'
+    # DependsOn: DomainControllerWaitCondition
+    DependsOn: DomainController
+    Properties:
+      ImageId: !FindInMap 
+        - AWSRegion2AMI
+        - !Ref 'AWS::Region'
+        - Windows2012r2
+      InstanceType: m4.large
+      SecurityGroups:
+        - !Ref DomainMemberSecurityGroup
+      KeyName: !Ref KeyName
+      UserData:
+        Fn::Base64: !Sub |
+          <script>
+          cfn-init.exe -v -s ${AWS::StackId} -r ADFSServer --region ${AWS::Region}
+          </script>
+      Tags:
+        - Key: Name
+          Value: !Sub ${DomainDNSName} ADFS server
+
+    Metadata:
+      'AWS::CloudFormation::Init':
+        config:
+          files:
+            'c:\cfn\cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+            'C:\cfn\scripts\SetDNSServer.ps1':
+              content: !Sub |
+                $netadapter = Get-NetAdapter
+                Set-DnsClientServerAddress -InterfaceIndex $netadapter.ifIndex -ServerAddress ("${DomainController.PrivateIp}")
+            'C:\cfn\scripts\JoinDomain.ps1':
+              content: !Sub |
+                $adminpassword = Convertto-SecureString -String 'Budapest99' -Force -AsPlainText
+                $DomainAdminCreds = New-Object System.Management.Automation.PSCredential("${DomainNetBIOSName}\domainAdmin", $adminpassword)
+                Add-Computer -DomainName ${DomainNetBIOSName} -Credential $DomainAdminCreds -Restart -Force
+
+          commands:
+            1-set-dns-server:
+              command: powershell.exe -command C:\cfn\scripts\SetDNSServer.ps1 > C:\cfn\log\set-dns-server.log
+            2-join-domain:
+              command: powershell.exe -command C:\cfn\scripts\JoinDomain.ps1 > C:\cfn\log\join-domain.log
+          services:
+            windows:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - 'c:\cfn\cfn-hup.conf'
+                  - 'c:\cfn\hooks.d\cfn-auto-reloader.conf'
+
+  DomainControllerWaitCondition:
+    Type: 'AWS::CloudFormation::WaitCondition'
+    DependsOn: DomainController
+    Properties:
+      Handle: !Ref DomainControllerWaitHandle
+      Timeout: '1200'
+      
+  DomainControllerWaitHandle:
+    Type: 'AWS::CloudFormation::WaitConditionHandle'
+    
+  DomainControllerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Domain Controller
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: '123'
+          ToPort: '123'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '135'
+          ToPort: '135'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: udp
+          FromPort: '138'
+          ToPort: '138'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '1024'
+          ToPort: '65535'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '389'
+          ToPort: '389'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: udp
+          FromPort: '389'
+          ToPort: '389'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '636'
+          ToPort: '636'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '3268'
+          ToPort: '3268'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '3269'
+          ToPort: '3269'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '53'
+          ToPort: '53'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: udp
+          FromPort: '53'
+          ToPort: '53'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '88'
+          ToPort: '88'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: udp
+          FromPort: '88'
+          ToPort: '88'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '445'
+          ToPort: '445'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: udp
+          FromPort: '445'
+          ToPort: '445'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: udp
+          FromPort: '135'
+          ToPort: '135'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+        - IpProtocol: tcp
+          FromPort: '3389'
+          ToPort: '3389'
+          CidrIp: !Ref SourceCidrForRDP
+        - IpProtocol: icmp
+          FromPort: '-1'
+          ToPort: '-1'
+          SourceSecurityGroupName: !Ref DomainMemberSecurityGroup
+          
+  DomainMemberSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Domain Members
+      SecurityGroupIngress: []
+      
+  DomainMemberSecurityGroupIngress1:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupName: !Ref DomainMemberSecurityGroup
+      IpProtocol: tcp
+      FromPort: '3389'
+      ToPort: '3389'
+      CidrIp: !Ref SourceCidrForRDP
+      
+Outputs:
+
+  DomainControllerDNSName:
+    Value: !GetAtt 
+      - DomainController
+      - PublicDnsName
+    Description: Public DNS name of Active Directory server for RDP connection
+    
+  DomainControllerIP:
+    Value: !GetAtt 
+      - DomainController
+      - PrivateIp
+    Description: Private IP address of Active Directory server which is also a DNS server
+    
+  DomainAdmin:
+    Value: !Sub ${DomainNetBIOSName}\Administrator
+    Description: Default domain administrator account
+    
+  DomainAdminPassword:
+    Value: Please retrieve Administrator password of the instance
