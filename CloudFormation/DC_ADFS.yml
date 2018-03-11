@@ -103,7 +103,38 @@ Mappings:
       Windows2012r2: ami-42b6a320
       
 Resources:
-
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+  RolePolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: S3Download
+      PolicyDocument:
+        Statement:
+        - Action:
+          - s3:GetObject
+          Effect: Allow
+          Resource: arn:aws:s3:::lastpass-ad-artifacts/keys/cloud.lastpass.com.pfx
+          # Resource: arn:aws:s3:::your-bucket/index.html
+      Roles:
+      - Ref: InstanceRole
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: InstanceRole
+      
   DomainController:
     Type: 'AWS::EC2::Instance'
     Properties:
@@ -203,6 +234,10 @@ Resources:
         Timeout: PT20M
 
     Metadata:
+      'AWS::CloudFormation::Authentication':
+        S3AccessCreds:
+          type: "S3"
+          roleName: InstanceRole
       'AWS::CloudFormation::Init':
         config:
           files:
@@ -212,7 +247,8 @@ Resources:
                 stack=${AWS::StackId}
                 region=${AWS::Region}
             'C:\cfn\keys\cloud.lastpass.com.pfx':
-              source: "https://s3-eu-west-1.amazonaws.com/lastpass-ad-artifacts/keys/cloud.lastpass.com.pfx"
+              source: "https://s3-eu-west-1.amazonaws.com/lastpass-ad-artifacts/keys/cloud.lastpass.com.p12"
+              authentication: "S3AccessCreds"
             'C:\cfn\scripts\SetDNSServer.ps1':
               content: !Sub |
                 $netadapter = Get-NetAdapter
